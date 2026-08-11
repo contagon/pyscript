@@ -105,7 +105,7 @@ class DecoratorRegistry:
 
         if know_decorator := cls._decorators.get(dec_name):
             if has_args:
-                args = await ast_ctx.eval_elt_list(dec_expr.args)
+                args = await cls._eval_decorator_args(ast_ctx, dec_expr.args, know_decorator)
                 kwargs = {keyw.arg: await ast_ctx.aeval(keyw.value) for keyw in dec_expr.keywords}
             else:
                 args = []
@@ -115,6 +115,55 @@ class DecoratorRegistry:
             return decorator
 
         return None
+
+    @classmethod
+    async def _eval_decorator_args(
+        cls, ast_ctx: AstEval, arg_nodes: list[ast.expr], dec_class: type[Decorator]
+    ) -> list[Any]:
+        """
+        Evaluate decorator positional args, unparsing expressions for ExpressionDecorators.
+
+        For decorators that consume expression strings (ExpressionDecorator subclasses),
+        non-literal, non-variable AST nodes are converted back to source strings via
+        ast.unparse(). This allows writing e.g. @state_trigger(light.kitchen == 'on')
+        without quotes, while preserving the existing string-based API.
+        """
+        # Non-expression decorators: evaluate everything normally
+        if not hasattr(dec_class, "create_expression"):
+            return await ast_ctx.eval_elt_list(arg_nodes)
+
+        args = []
+        for node in arg_nodes:
+            if isinstance(node, ast.Constant):
+                # String/number literal - use value directly
+                args.append(node.value)
+            elif isinstance(node, ast.Name):
+                # Variable reference - evaluate to get runtime value
+                args.append(await ast_ctx.aeval(node))
+            elif isinstance(node, (ast.List, ast.Set)):
+                # List/set of expressions - unparse non-literal elements
+                elements = []
+                for elt in node.elts:
+                    if isinstance(elt, ast.Constant):
+                        elements.append(elt.value)
+                    elif isinstance(elt, ast.Name):
+                        elements.append(await ast_ctx.aeval(elt))
+                    else:
+                        elements.append(ast.unparse(elt))
+                args.append(elements if isinstance(node, ast.List) else set(elements))
+            elif isinstance(node, ast.Starred):
+                # *var - evaluate and expand into args list
+                args.extend(await ast_ctx.aeval(node.value))
+            else:
+                # Check if this looks like a trigger expression (comparison, boolean logic,
+                # bare entity attribute) vs something that should be evaluated (f-string,
+                # function call, string concatenation, etc.)
+                if isinstance(node, (ast.Compare, ast.BoolOp, ast.UnaryOp, ast.Attribute)):
+                    args.append(ast.unparse(node))
+                else:
+                    # f-strings, calls, binops, etc. - evaluate to get the string value
+                    args.append(await ast_ctx.aeval(node))
+        return args
 
     @classmethod
     async def wait_until(cls, ast_ctx: AstEval, *args: Any, **kwargs: Any) -> Any:
